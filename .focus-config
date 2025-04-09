@@ -1,0 +1,29 @@
+[16]
+
+
+[[workspace]]
+./
+../../seed
+../../libDaisy/src
+../../DaisySP
+
+
+[ignore]
+
+build/**
+
+
+
+
+[[build commands]]
+build_working_dir:      %PROJECT_CONFIG_DIR%
+open_panel_on_build:    true  #  <- any settings specified here will apply to all commands unless overridden
+close_panel_on_success: true
+auto_jump_to_error:     true
+
+[Build]   # <- command name. Can be arbitrary
+build_command:          build.bat  # should be an executable or a script
+build_working_dir:      %PROJECT_CONFIG_DIR%
+# timeout_in_seconds:     5             # if you don't want a timeout, don't specify it
+error_regex:            ^(?P<file>.*):(?P<line>\d+):(?P<col>\d+): (?P<type>error|warning): (?P<msg>.*) (\[(?P<msg1>.*)\])?$
+key_binding:            F5
