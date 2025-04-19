@@ -10,6 +10,7 @@
 #define local_const static const
 #define global_const static const 
 #define local_persist static
+#define global static
 
 typedef uint32_t u32;
 typedef int32_t i32;
@@ -18,14 +19,25 @@ typedef int16_t i16;
 typedef uint8_t u8;
 typedef int8_t i8;
 
-#include "data/base_ir.h"
 
 using namespace daisy;
 using namespace daisysp;
 
-global_const u16 BLOCK_SIZE = 4;
-global_const u16 UPSAMPLE_FACTOR = 4;
+global_const u16 BLOCK_SIZE = 8;
+global_const u16 UPSAMPLE_FACTOR = 2;
 global_const u16 UP_BLOCK_SIZE = BLOCK_SIZE * UPSAMPLE_FACTOR;
+
+global_const float tube_gain = 100.0f;
+
+
+global_const u32 fft_size = 512;
+global_const u32 dft_buffer_size = fft_size + 2;
+alignas(16) global float ir_input_buffer[fft_size] = {0};
+alignas(16) global float signal_dft_buffer[dft_buffer_size] = {0};
+alignas(16) global float convolution_dft[dft_buffer_size] = {0};
+alignas(16) global float convolution_result[fft_size] = {0};
+
+#include "data/base_ir.h"
 
 enum KnobsCodes {
 
@@ -141,8 +153,7 @@ void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float 
 
     float A = 0.0f;
     float a0inv = 0.0f;
-    float beta = 0.0f;
-
+        
     switch (type) {
         case BIQUAD_LOWPASS: {
             a0inv = 1.0f/(1.0f + alpha);
@@ -176,33 +187,6 @@ void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float 
             f->b2 = (1.0f - alpha * A) * a0inv; 
             f->a1 = f->b1;
             f->a2 = (1.0f - alpha / A) * a0inv;
-            break;
-        }
-
-        case BIQUAD_LOWSHELF:  {
-            A = powf(10.0f, gaindB/40.0f);
-            beta = sqrtf(A)/Q;
-
-            a0inv = 1.0f/((A+1.0f) + (A-1.0f)*cosw0 + beta*sinw0);
-            
-            f->b0 = (A*((A+1.0f) - (A-1.0f)*cosw0 + beta*sinw0)) * a0inv;
-            f->b1 = (2.0f*A*((A-1.0f) - (A+1.0f)*cosw0)) * a0inv;
-            f->b2 = (A*((A+1.0f) - (A-1.0f)*cosw0 - beta*sinw0)) * a0inv;
-            f->a1 = (-2.0f*((A-1.0f) + (A+1.0f)*cosw0)) * a0inv;
-            f->a2 = ((A+1.0f) + (A-1.0f)*cosw0 - beta*sinw0) * a0inv;
-            break;
-        }
-
-        case BIQUAD_HIGHSHELF: {
-            A = powf(10.0f, gaindB/40.0f);
-            beta = sqrtf(A)/Q;
-            a0inv = 1.0f/((A+1.0f) - (A-1.0f)*cosw0 + beta*sinw0);
-
-            f->b0 = (A*((A+1.0f) + (A-1.0f)*cosw0 + beta*sinw0)) * a0inv;
-            f->b1 = (-2.0f*A*((A-1.0f) + (A+1.0f)*cosw0)) * a0inv;
-            f->b2 = (A*((A+1.0f) + (A-1.0f)*cosw0 - beta*sinw0)) * a0inv;
-            f->a1 = (2.0f*((A-1.0f) - (A+1.0f)*cosw0)) * a0inv;
-            f->a2 = ((A+1.0f) - (A-1.0f)*cosw0 - beta*sinw0) * a0inv;
             break;
         }
 
@@ -311,8 +295,7 @@ struct DSPData {
     float samplerate = 0.0f;
     float upsamplerate = 0.0f;
     
-    struct {
-        
+    struct ParamStates {
         float gain1 = 0.0f;
         float gain2 = 0.0f; 
         float volume = 0.0f;
@@ -320,6 +303,10 @@ struct DSPData {
         float low = 0.5f;
         float mid = 0.5f;
         float trebble = 0.5f;
+        
+        bool bright = true;
+        u8 channel = 0;
+
     } param_states;   
 
     
@@ -364,12 +351,12 @@ struct DSPData {
         ShelfFilter cathode_bypass_filter2;
         OnePole couplingFilter2;
         OnePole stage2LP;
-        float attenuation2 = 0.8f;
+        const float attenuation2 = 0.5f * tube_gain;
 
         ShelfFilter cathode_bypass_filter3;
         OnePole couplingFilter3;
         OnePole stage3LP;
-        float attenuation3 = 0.4f;
+        const float attenuation3 = 0.1f * tube_gain;
 
         ShelfFilter cathode_bypass_filter4;
         OnePole couplingFilter4;
@@ -392,9 +379,6 @@ struct DSPData {
         float stage4_bias[2] = {0};
     
         float outputAttenuationdB = -34.0f;
-        u8 channel = 0;
-        bool bright = true;
-
     } preamp;
     
     ShelfFilter resonance;
@@ -422,14 +406,14 @@ struct DSPData {
     } tonestack;
 
     struct IRLoader {
-
+        PFFFT_Setup* fft_setup = nullptr;
     } irloader;
 
     float masterVolume = 0.0f;
 } dsp;
 
 
-struct TonestackCtes {
+global_const struct TonestackCtes {
     const double beta11 = 0.0001175;
     const double beta12 = 0.0005;
     const double beta13 = 0.02047;
@@ -538,116 +522,115 @@ Switch switches[NSWITCHES];
 void AudioCallback(AudioHandle::InputBuffer  in,
                    AudioHandle::OutputBuffer out,
                    size_t nsamples)
-{   
-    local_const float tube_gain = 100.0f;
-    
-    float gain1 = hardware.adc.GetFloat(Knob1);
-    float gain2 = hardware.adc.GetFloat(Knob2);
-    float volume = hardware.adc.GetFloat(Knob3);
-    
-    switches[Toggle4].Debounce();
-    switches[Toggle3].Debounce();
-    switches[Toggle2].Debounce();
-    switches[Toggle1].Debounce();
-    switches[FS1].Debounce();
-    switches[FS2].Debounce();
-
-
-    // 0 = 3 stages, 1 = 5 stages
-    u8 channel = (u8)switches[Toggle4].Pressed();
-    dsp.preamp.channel = channel;
-    
-    if (dsp.param_states.gain1 != gain1) {        
-        dsp.param_states.gain1 = tube_gain * scale(gain1, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
-
-        shelf_set_coeffs(&dsp.preamp.brightCapFilter, 550.0f, 
-                        scale_linear(gain1, 0.0f, 1.0f, -15.0f, 0.0f),
-                        dsp.samplerate, lowshelf);
-    }
-    
-    if (dsp.param_states.gain2 != gain2) {
-        dsp.param_states.gain2 = tube_gain * scale(gain2, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
-    }
-    
-    if (dsp.param_states.volume != volume) {
-        dsp.param_states.volume = scale(volume, 0.0f, 1.0f, 0.0f, 1.0f, 3.0f);
-    }
-    
-    // bool bright_switch = switches[Toggle3].Pressed();
-    bool bright_switch = true;
-    
-    // switches[Toggle2].Pressed();
-    // switches[Toggle1].Pressed();
-    // switches[FS1].Pressed();
-    // switches[FS2].Pressed();
-    
-    
-    float low = hardware.adc.GetFloat(Knob4);
-    float mid = hardware.adc.GetFloat(Knob5);
-    float trebble = hardware.adc.GetFloat(Knob6);
-
-    if (low != dsp.param_states.low
-        || mid != dsp.param_states.mid
-        || trebble != dsp.param_states.trebble)    
+{
     {
-        // recompute tonestack
+        float gain1 = hardware.adc.GetFloat(Knob1);
+        float gain2 = hardware.adc.GetFloat(Knob2);
+        float volume = hardware.adc.GetFloat(Knob3);
         
-        dsp.param_states.low = low;
-        dsp.param_states.mid = mid;
-        dsp.param_states.trebble = trebble;
-     
-        low = scale_linear(low, 0.0f, 1.0f, 0.0f, 1.0f);
-        // mid = scale_linear(m, 0.0f, 1.0f, 0.0f, 1.5f);
-        // trebble = scale_linear(t, 0.0f, 1.0f, 0.0f, 1.0f);
+        switches[Toggle4].Debounce();
+        switches[Toggle3].Debounce();
+        switches[Toggle2].Debounce();
+        switches[Toggle1].Debounce();
+        switches[FS1].Debounce();
+        switches[FS2].Debounce();
+            
+        // 0 = 3 stages, 1 = 5 stages
+        dsp.param_states.channel = (u8)switches[Toggle4].Pressed();
         
-        double Low = exp((low-1.0)*3.4);
+        if (dsp.param_states.gain1 != gain1) {        
+            dsp.param_states.gain1 = tube_gain * scale(gain1, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
     
-        double B1 = trebble*ctes.beta11 + mid*ctes.beta12 + Low*ctes.beta13 + ctes.beta14;
-    
-        double B2 = trebble*ctes.beta21 
-                  - mid*mid*ctes.beta22
-                  + mid*ctes.beta23
-                  + Low*ctes.beta24
-                  + Low*mid*ctes.beta25
-                  + ctes.beta26;
-    
-        double B3 = Low*mid*ctes.beta31
-                  - mid*mid*ctes.beta32
-                  + mid*ctes.beta33
-                  + trebble*ctes.beta34 - trebble*mid*ctes.beta35
-                  + trebble*Low*ctes.beta36;
-    
-        double A0 = 1.0;
-    
-        double A1 = ctes.alpha11
-                  + mid*ctes.alpha12 + Low*ctes.alpha13;
-    
-        double A2 = mid*ctes.alpha21
-                  + Low*mid*ctes.alpha22
-                  - mid*mid*ctes.alpha23
-                  + Low*ctes.alpha24
-                  + ctes.alpha25;
-    
-        double A3 = Low*mid*ctes.alpha31
-                  - mid*mid*ctes.alpha32
-                  + mid*ctes.alpha33
-                  + Low*ctes.alpha34
-                  + ctes.alpha35;
-    
-        double c = 2.0*dsp.samplerate;
-    
-    
-        double a0 = -A0 - A1*c - A2 * pow(c, 2.0) - A3 * pow(c, 3.0);
-    
-        dsp.tonestack.b0 = (float)((-B1*c - B2 * pow(c, 2.0) - B3 * pow(c, 3.0))/a0);
-        dsp.tonestack.b1 = (float)((-B1*c + B2 * pow(c, 2.0) + 3*B3 * pow(c, 3.0))/a0);
-        dsp.tonestack.b2 = (float)((B1*c + B2 * pow(c, 2.0) - 3*B3 * pow(c, 3.0))/a0);
-        dsp.tonestack.b3 = (float)((B1*c - B2 * pow(c, 2.0) + B3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a1 = (float)((-3*A0 - A1*c + A2 * pow(c, 2.0) + 3*A3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a2 = (float)((-3*A0 + A1*c + A2 * pow(c, 2.0) - 3*A3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a3 = (float)((-A0 + A1*c - A2 * pow(c, 2.0) + A3 * pow(c, 3.0))/a0);
+            shelf_set_coeffs(&dsp.preamp.brightCapFilter, 550.0f, 
+                            scale_linear(gain1, 0.0f, 1.0f, -15.0f, 0.0f),
+                            dsp.upsamplerate, lowshelf);
+        }
+        
+        if (dsp.param_states.gain2 != gain2) {
+            dsp.param_states.gain2 = tube_gain * scale(gain2, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
+        }
+        
+        if (dsp.param_states.volume != volume) {
+            dsp.param_states.volume = scale(volume, 0.0f, 1.0f, 0.0f, 1.0f, 3.0f);
+        }
+        
+        dsp.param_states.bright = switches[Toggle3].Pressed();
+        
+        // switches[Toggle2].Pressed();
+        // switches[Toggle1].Pressed();
+        // switches[FS1].Pressed();
+        // switches[FS2].Pressed();
+        
+        
+        float low = hardware.adc.GetFloat(Knob4);
+        float mid = hardware.adc.GetFloat(Knob5);
+        float trebble = hardware.adc.GetFloat(Knob6);
+
+        if (low != dsp.param_states.low
+            || mid != dsp.param_states.mid
+            || trebble != dsp.param_states.trebble)    
+        {
+            // recompute tonestack
+            
+            dsp.param_states.low = low;
+            dsp.param_states.mid = mid;
+            dsp.param_states.trebble = trebble;
+         
+            low = scale_linear(low, 0.0f, 1.0f, 0.0f, 1.0f);
+            // mid = scale_linear(m, 0.0f, 1.0f, 0.0f, 1.5f);
+            // trebble = scale_linear(t, 0.0f, 1.0f, 0.0f, 1.0f);
+            
+            double Low = exp((low-1.0)*3.4);
+        
+            double B1 = trebble*ctes.beta11 + mid*ctes.beta12 + Low*ctes.beta13 + ctes.beta14;
+        
+            double B2 = trebble*ctes.beta21 
+                      - mid*mid*ctes.beta22
+                      + mid*ctes.beta23
+                      + Low*ctes.beta24
+                      + Low*mid*ctes.beta25
+                      + ctes.beta26;
+        
+            double B3 = Low*mid*ctes.beta31
+                      - mid*mid*ctes.beta32
+                      + mid*ctes.beta33
+                      + trebble*ctes.beta34 - trebble*mid*ctes.beta35
+                      + trebble*Low*ctes.beta36;
+        
+            double A0 = 1.0;
+        
+            double A1 = ctes.alpha11
+                      + mid*ctes.alpha12 + Low*ctes.alpha13;
+        
+            double A2 = mid*ctes.alpha21
+                      + Low*mid*ctes.alpha22
+                      - mid*mid*ctes.alpha23
+                      + Low*ctes.alpha24
+                      + ctes.alpha25;
+        
+            double A3 = Low*mid*ctes.alpha31
+                      - mid*mid*ctes.alpha32
+                      + mid*ctes.alpha33
+                      + Low*ctes.alpha34
+                      + ctes.alpha35;
+        
+            double c = 2.0*dsp.samplerate;
+        
+        
+            double a0 = -A0 - A1*c - A2 * pow(c, 2.0) - A3 * pow(c, 3.0);
+        
+            dsp.tonestack.b0 = (float)((-B1*c - B2 * pow(c, 2.0) - B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b1 = (float)((-B1*c + B2 * pow(c, 2.0) + 3*B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b2 = (float)((B1*c + B2 * pow(c, 2.0) - 3*B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b3 = (float)((B1*c - B2 * pow(c, 2.0) + B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a1 = (float)((-3*A0 - A1*c + A2 * pow(c, 2.0) + 3*A3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a2 = (float)((-3*A0 + A1*c + A2 * pow(c, 2.0) - 3*A3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a3 = (float)((-A0 + A1*c - A2 * pow(c, 2.0) + A3 * pow(c, 3.0))/a0);
+        }    
     }
-    
+
+
+
     local_persist float audio_buffer[BLOCK_SIZE] = {0};
     memcpy(audio_buffer, in[0], nsamples * sizeof(float));
     
@@ -685,7 +668,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             preamp.inputMudFilter.ProcessBlock(up_buffer, UP_BLOCK_SIZE);
             biquad_process(&preamp.midBoost, up_buffer, UP_BLOCK_SIZE);
             
-            if (bright_switch) {
+            if (dsp.param_states.bright) {
                 shelf_process(&preamp.brightCapFilter, up_buffer, UP_BLOCK_SIZE);
             }
     
@@ -708,7 +691,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             preamp.couplingFilter2.ProcessBlock(up_buffer, UP_BLOCK_SIZE);
             preamp.stage2LP.ProcessBlock(up_buffer, UP_BLOCK_SIZE);
     
-            if (channel == 0) {
+            if (dsp.param_states.channel == 0) {
                 goto gain_stages_end_of_scope;
             }
     
@@ -734,7 +717,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             
             preamp.couplingFilter4.ProcessBlock(up_buffer, UP_BLOCK_SIZE);
             preamp.stage4LP.ProcessBlock(up_buffer, UP_BLOCK_SIZE);
-    
+        
             gain_stages_end_of_scope: {}
         }
         
@@ -746,6 +729,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
     #endif
+    
     #if 1
     // tonestack
     {
@@ -775,20 +759,40 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     #endif
     
     // res / pres
+    shelf_process(&dsp.resonance, audio_buffer, nsamples);
+    shelf_process(&dsp.presence, audio_buffer, nsamples);
+    
     
     // irloader
-    {
-    }
+    // {
+    //     // memcpy(ir_input_buffer, ir_input_buffer + BLOCK_SIZE, (fft_size - BLOCK_SIZE) * sizeof(float));
+        
+    //     for (u32 index = 0; index < fft_size - BLOCK_SIZE; index++) {
+    //         ir_input_buffer[index] = ir_input_buffer[index + BLOCK_SIZE];
+    //     }
+        
+    //     memcpy(&ir_input_buffer[fft_size-BLOCK_SIZE -1], audio_buffer, BLOCK_SIZE * sizeof(float));
     
-    // volume
-
+    //     pffft_transform(dsp.irloader.fft_setup, ir_input_buffer, signal_dft_buffer, nullptr, PFFFT_FORWARD);
     
-
-    //Fill the block with samples
-    for(size_t i = 0; i < nsamples; i += 2)
+    //     memset(convolution_dft, 0, dft_buffer_size * sizeof(float));
+    //     pffft_zconvolve_accumulate(dsp.irloader.fft_setup, signal_dft_buffer, ir_dft, convolution_dft, 1.0f);
+        
+    //     pffft_transform(dsp.irloader.fft_setup, convolution_dft, convolution_result, nullptr, PFFFT_BACKWARD);
+    
+    //     memcpy(audio_buffer, &convolution_result[fft_size - BLOCK_SIZE], BLOCK_SIZE * sizeof(float));
+        
+    //     for (u32 index = 0; index < nsamples; index++) {
+    //         local_const float inv_fft_size = 1.0f/fft_size;
+    //         audio_buffer[index] *= inv_fft_size;
+    //     }
+    // }
+    
+    
+    for(u32 index = 0; index < nsamples; index++)
     {
-        out[0][i] = audio_buffer[i] * volume;
-        out[1][i] = 0.0f;
+        out[0][index] = audio_buffer[index] * dsp.param_states.volume;
+        out[1][index] = 0.0f;
     }
 }
 
@@ -958,20 +962,126 @@ int main(void) {
     }
     
     shelf_reset(&dsp.resonance);
-    shelf_set_coeffs(&dsp.resonance, 120.0f, 0.0f, dsp.samplerate, lowshelf);
+    shelf_set_coeffs(&dsp.resonance, 120.0f, scale_linear(0.5f, 0.0f, 1.0f, 0.0f, 24.0f), dsp.samplerate, lowshelf);
     
     shelf_reset(&dsp.resonance);
-    shelf_set_coeffs(&dsp.resonance, 500.0f, 0.0f, dsp.samplerate, highshelf);
+    shelf_set_coeffs(&dsp.resonance, 500.0f, scale_linear(0.5f, 0.0f, 1.0f, 0.0f, 18.0f), dsp.samplerate, highshelf);
+
+    {
+        dsp.irloader.fft_setup = pffft_new_setup(fft_size, PFFFT_REAL);
+        
+    }
+
 
     //Start calling the audio callback
     hardware.StartAudio(AudioCallback);
 
     // Loop forever
-    for(;;) {
-        System::Delay(500);
+    while (0) {
+        float gain1 = hardware.adc.GetFloat(Knob1);
+        float gain2 = hardware.adc.GetFloat(Knob2);
+        float volume = hardware.adc.GetFloat(Knob3);
         
-        float dummy = sin(1.0);
-        dummy = cos(dummy);
+        switches[Toggle4].Debounce();
+        switches[Toggle3].Debounce();
+        switches[Toggle2].Debounce();
+        switches[Toggle1].Debounce();
+        switches[FS1].Debounce();
+        switches[FS2].Debounce();
+            
+        // 0 = 3 stages, 1 = 5 stages
+        dsp.param_states.channel = (u8)switches[Toggle4].Pressed();
         
+        if (dsp.param_states.gain1 != gain1) {        
+            dsp.param_states.gain1 = tube_gain * scale(gain1, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
+    
+            shelf_set_coeffs(&dsp.preamp.brightCapFilter, 550.0f, 
+                            scale_linear(gain1, 0.0f, 1.0f, -15.0f, 0.0f),
+                            dsp.upsamplerate, lowshelf);
+        }
+        
+        if (dsp.param_states.gain2 != gain2) {
+            dsp.param_states.gain2 = tube_gain * scale(gain2, 0.0f, 1.0f, 0.0f, 1.0f, 2.5f);
+        }
+        
+        if (dsp.param_states.volume != volume) {
+            dsp.param_states.volume = scale(volume, 0.0f, 1.0f, 0.0f, 1.0f, 3.0f);
+        }
+        
+        dsp.param_states.bright = switches[Toggle3].Pressed();
+        
+        // switches[Toggle2].Pressed();
+        // switches[Toggle1].Pressed();
+        // switches[FS1].Pressed();
+        // switches[FS2].Pressed();
+        
+        
+        float low = hardware.adc.GetFloat(Knob4);
+        float mid = hardware.adc.GetFloat(Knob5);
+        float trebble = hardware.adc.GetFloat(Knob6);
+
+        if (low != dsp.param_states.low
+            || mid != dsp.param_states.mid
+            || trebble != dsp.param_states.trebble)    
+        {
+            // recompute tonestack
+            
+            dsp.param_states.low = low;
+            dsp.param_states.mid = mid;
+            dsp.param_states.trebble = trebble;
+         
+            low = scale_linear(low, 0.0f, 1.0f, 0.0f, 1.0f);
+            // mid = scale_linear(m, 0.0f, 1.0f, 0.0f, 1.5f);
+            // trebble = scale_linear(t, 0.0f, 1.0f, 0.0f, 1.0f);
+            
+            double Low = exp((low-1.0)*3.4);
+        
+            double B1 = trebble*ctes.beta11 + mid*ctes.beta12 + Low*ctes.beta13 + ctes.beta14;
+        
+            double B2 = trebble*ctes.beta21 
+                      - mid*mid*ctes.beta22
+                      + mid*ctes.beta23
+                      + Low*ctes.beta24
+                      + Low*mid*ctes.beta25
+                      + ctes.beta26;
+        
+            double B3 = Low*mid*ctes.beta31
+                      - mid*mid*ctes.beta32
+                      + mid*ctes.beta33
+                      + trebble*ctes.beta34 - trebble*mid*ctes.beta35
+                      + trebble*Low*ctes.beta36;
+        
+            double A0 = 1.0;
+        
+            double A1 = ctes.alpha11
+                      + mid*ctes.alpha12 + Low*ctes.alpha13;
+        
+            double A2 = mid*ctes.alpha21
+                      + Low*mid*ctes.alpha22
+                      - mid*mid*ctes.alpha23
+                      + Low*ctes.alpha24
+                      + ctes.alpha25;
+        
+            double A3 = Low*mid*ctes.alpha31
+                      - mid*mid*ctes.alpha32
+                      + mid*ctes.alpha33
+                      + Low*ctes.alpha34
+                      + ctes.alpha35;
+        
+            double c = 2.0*dsp.samplerate;
+        
+        
+            double a0 = -A0 - A1*c - A2 * pow(c, 2.0) - A3 * pow(c, 3.0);
+        
+            dsp.tonestack.b0 = (float)((-B1*c - B2 * pow(c, 2.0) - B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b1 = (float)((-B1*c + B2 * pow(c, 2.0) + 3*B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b2 = (float)((B1*c + B2 * pow(c, 2.0) - 3*B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.b3 = (float)((B1*c - B2 * pow(c, 2.0) + B3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a1 = (float)((-3*A0 - A1*c + A2 * pow(c, 2.0) + 3*A3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a2 = (float)((-3*A0 + A1*c + A2 * pow(c, 2.0) - 3*A3 * pow(c, 3.0))/a0);
+            dsp.tonestack.a3 = (float)((-A0 + A1*c - A2 * pow(c, 2.0) + A3 * pow(c, 3.0))/a0);
+        }
+        
+        System::Delay(30);
     }
 }

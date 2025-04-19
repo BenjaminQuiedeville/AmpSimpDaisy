@@ -11,7 +11,8 @@ D:/Dev/AmpModeler/Source
 [ignore]
 
 build/**
-
+*.lst
+*.map
 
 
 

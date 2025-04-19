@@ -10,7 +10,7 @@ run("make clean")
 
 result = 0
 
-rewrite_ir = False
+rewrite_ir = True
 if rewrite_ir:
     result = run("pushd data && julia --startup-file=no ir_generation.jl && popd")
 
