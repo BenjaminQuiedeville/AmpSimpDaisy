@@ -1,1 +1,6 @@
 build
+*.pdb
+*.ilk
+*.exe
+*.obj
+*.rdi

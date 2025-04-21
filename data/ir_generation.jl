@@ -1,40 +1,88 @@
 using WAV
 using DSP
+using Statistics
 
 long_ir_filename = "default_IR_48.wav"
+# long_ir_filename = "D:/Projets musique/ImpulseResponses/Rainbows/48/02 DV30.wav"
+
 
 long_file, sr, _, _ = wavread(long_ir_filename)
 
-short_ir_size = 512
-dft_n_bins = 1024 / 2 + 1
+short_size = 512
 
-end_curve = 0.5 .* cos.(LinRange(0, pi, 100)) .+ 0.5
+tail_env_size = 100
+tail_env = 0.5 .* cos.(LinRange(0, pi, tail_env_size)) .+ 0.5
 
-# short_file = long_file[begin : 1024]
-# short_file[end-99 : end] .*= end_curve
+short_file = long_file[begin : short_size]
+short_file[end-(tail_env_size-1) : end] .*= tail_env
 
-short_file = zeros(Float64, short_ir_size);
-short_file[1] = 1.0
+short_file .-= mean(short_file)
 
-dft = DSP.rfft(short_file)
+wavwrite(short_file, "base_ir.wav"; Fs = sr)
 
+# short_file = zeros(Float64, short_size);
+# short_file[1] = 1.0
 
 open("base_ir.h", "w") do io 
 
-    write(io, "alignas(16) global_const float ir_dft[dft_buffer_size] = {\n")
+    block_size = 8
+    part_size = 4 * block_size
+    nparts  =  Int(length(short_file) / block_size)
+
+    reshaped = reshape(short_file, block_size, :)
     
-    for element in dft
-        write(io, "$(string(Float32(element.re)))f, ")
+    write(io, "global_const float ir_parts[npartitions][fft_size] = {\n")
+    
+    for i in 1:nparts
+        
+        time_signal = zeros(part_size)
+        time_signal[1:block_size] .= reshaped[:, i]
+        
+        dft = DSP.rfft(time_signal)
+        
+        write(io, "{\n\t")
+        
+        for bin_index in 1:length(dft)
+            write(io, "$(string(Float32(dft[bin_index].re)))f, ")
+        end
+        write(io, "\n\t")
+        
+        for bin_index in 2:(length(dft)-1)
+            write(io, "$(string(Float32(dft[bin_index].im)))f, ")
+        end
+    
+        write(io, "\n},\n")
     end
     
-    write(io, "\n")
+    write(io, "};\n")
+end
+
+# open("base_ir.h", "w") do io 
+
+    # dft = DSP.rfft(short_file)
+    # write(io, "alignas(16) global_const float ir_dft[dft_buffer_size] = {\n")
     
-    for element in dft
-        write(io, "$(string(Float32(element.im)))f, ")
-    end
+    # for index in 1:Int(fft_size/2)
+    #     write(io, "$(string(Float32(dft[index].re)))f, ")
+    # end
+    
+    # write(io, "\n")
+    
+    # for index in 1:Int(fft_size/2) - 1
+    #     write(io, "$(string(Float32(dft[index].im)))f, ")
+    # end
+# end 
 
-    write(io, "\n};\n")
-end 
+# open("base_ir.h", "w") do io 
+    # write(io, "\n};\n")
 
+    # write(io, "global_const float ir[fft_size] = {")
+    
+    # for elem in short_file
+    #     write(io, "$(string(Float32(elem)))f, ")
+    # end
+    
+    # write(io, "};\n")
+# end 
 
 println("done")

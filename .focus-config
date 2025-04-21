@@ -5,16 +5,22 @@
 ./
 ../../seed
 ../../libDaisy/src
+../../stmlib
 ../../DaisySP
 D:/Dev/AmpModeler/Source
 
 [ignore]
-
-build/**
 *.lst
 *.map
-
-
+*.yml
+*.d
+*.hex
+*.obj
+*.exe
+*.ilk
+*.exp
+*.rdi
+build/**
 
 [[build commands]]
 build_working_dir:      %PROJECT_CONFIG_DIR%

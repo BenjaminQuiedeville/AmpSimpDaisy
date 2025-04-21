@@ -13,6 +13,7 @@ result = 0
 rewrite_ir = True
 if rewrite_ir:
     result = run("pushd data && julia --startup-file=no ir_generation.jl && popd")
+    if result != 0: exit(result)
 
 
 result = run("make")
