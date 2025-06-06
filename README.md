@@ -1,9 +1,2 @@
 # AmpSimp
-
-## Author
-
-<!-- Insert Your Name Here -->
-
-## Description
-
-<!-- Describe your example here -->
+Port of [AmpModeler](https://github.com/BenjaminQuiedeville/AmpModeler), a custom clean/high gain guitar amplifier modeler to the [Daisy](https://daisy.audio/) seed platform.
