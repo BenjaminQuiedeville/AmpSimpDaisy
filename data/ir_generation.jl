@@ -3,7 +3,7 @@ using DSP
 using Statistics
 
 long_ir_filename = "default_IR_48.wav"
-# long_ir_filename = "D:/Projets musique/ImpulseResponses/Rainbows/48/02 DV30.wav"
+# long_ir_filename = "D:/Projets musique/ImpulseResponses/IRs Nathan/Homemade/V30_BLEND.wav"
 
 
 long_file, sr, _, _ = wavread(long_ir_filename)
