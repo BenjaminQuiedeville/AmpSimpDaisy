@@ -2,13 +2,14 @@ using WAV
 using DSP
 using Statistics
 
-long_ir_filename = "default_IR_48.wav"
+# long_ir_filename = "default_IR_48.wav"
 # long_ir_filename = "D:/Projets musique/ImpulseResponses/IRs Nathan/Homemade/V30_BLEND.wav"
-
+long_ir_filename = "D:/Projets musique/ImpulseResponses/Rainbows/48/02 DV30.wav"
+# long_ir_filename = "D:/Projets musique/ImpulseResponses/Chainsaws/48/09 Dark Ribbon Doom.wav"
 
 long_file, sr, _, _ = wavread(long_ir_filename)
 
-short_size = 1024
+short_size = 1600
 
 tail_env_size = 30
 tail_env = 0.5 .* cos.(LinRange(0, pi, tail_env_size)) .+ 0.5
@@ -19,6 +20,19 @@ short_file[end-(tail_env_size-1) : end] .*= tail_env
 short_file .-= mean(short_file)
 
 wavwrite(short_file, "base_ir.wav"; Fs = sr)
+
+open("base_ir.h", "w") do io 
+    
+    write(io, "global_const u16 ir_size = $(short_size);\n")
+
+    write(io, "global_const float ir[ir_size] = {\n\t")
+    
+    for elem in short_file
+        write(io, "$(string(Float32(elem)))f, ")
+    end
+    
+    write(io, "\n};\n")
+end 
 
 # short_file = zeros(Float64, short_size);
 # short_file[1] = 1.0
@@ -72,18 +86,5 @@ wavwrite(short_file, "base_ir.wav"; Fs = sr)
     #     write(io, "$(string(Float32(dft[index].im)))f, ")
     # end
 # end 
-
-open("base_ir.h", "w") do io 
-    
-    write(io, "global_const u16 ir_size = $(short_size);\n")
-
-    write(io, "global_const float ir[ir_size] = {\n\t")
-    
-    for elem in short_file
-        write(io, "$(string(Float32(elem)))f, ")
-    end
-    
-    write(io, "\n};\n")
-end 
 
 println("done")

@@ -3,6 +3,7 @@
 #include "daisy_seed.h"
 
 #include "daisysp.h"
+// #include ""
 
 #define PFFFT_SIMD_DISABLE
 #include "pffft/pffft.c"
@@ -18,7 +19,7 @@ typedef uint16_t u16;
 typedef int16_t i16;
 typedef uint8_t u8;
 typedef int8_t i8;
-
+    
 
 using namespace daisy;
 using namespace daisysp;
@@ -27,7 +28,7 @@ global_const u16 BLOCK_SIZE = 16;
 global_const u16 UPSAMPLE_FACTOR = 4;
 global_const u16 UP_BLOCK_SIZE = BLOCK_SIZE * UPSAMPLE_FACTOR;
 
-global_const float tube_gain = 70.0f;
+global_const float tube_gain = 100.0f;
 global_const float smooth_tau_ms = 100.0f/BLOCK_SIZE;
 
 // float ir[ir_size]
@@ -37,46 +38,38 @@ global_const u16 npartitions = ir_size / BLOCK_SIZE;
 global_const u16 fft_size = 32;
 global_const u16 dft_size = fft_size + 2;
 
-
 global u16 monitor_index = 0;
 global_const u16 monitor_buffer_size = BLOCK_SIZE * 60;
 global float monitor_buffer[monitor_buffer_size] = {0};
 
-global_const float tight_freq_min = 10.0f;
-global_const float tight_freq_max = 800.0f;
+global_const u32 gate_buffer_length = 96;
+global float gate_buffer[gate_buffer_length] = {0};
 
-global_const float boost_amt_max = 20.0f;
-
-global_const float boost_freq_init = 1100.0f;
-global_const float boost_freq_min = 500.0f;
-global_const float boost_freq_max = 3000.0f;
+global_const float gate_thresh[2][2] = {
+    {-85.0f, -80.0f},
+    {-70.0f, -60.0f}
+};
 
 global_const float channel_biases[4][5] = {
-    {0.1f, 0.8f, 0.1f, 0.0f, 0.0f},
-    {0.1f, 0.2f, 0.1f, 0.0f, 0.0f},
-    {0.1f, 0.2f, 0.8f, 0.2f, 0.1f},
-    {0.1f, 0.3f, 0.1f, 0.2f, 0.1f},
+    {0.1f,  0.8f,  0.0f,  0.0f,  0.0f},
+    {0.1f,  0.2f,  0.1f,  0.0f,  0.0f},
+    {0.1f,  0.2f,  0.8f,  0.2f,  0.1f},
+    {0.1f,  0.1f,  0.1f,  0.2f,  0.1f},
 };
 
 global_const float cathode_bp_amount[4][5] {
-    {-2.0,  0.0, -1.0, 0.0, 0.0},
-    {-2.0, -2.0, -2.0, 0.0, 0.0},
-    {-3.0, -2.0, 0.0, -5.0, -3.0},
-    {-3.0, -2.0, -2.0, -4.0, -3.0},
+    {-2.0f,  0.0f, -1.0f,  0.0f,  0.0f},
+    {-2.0f, -1.0f, -1.0f,  0.0f,  0.0f},
+    {-3.0f, -2.0f,  0.0f, -3.0f, -1.0f},
+    {-2.0f, -3.0f, -1.0f, -2.0f, -3.0f},
 };
 
 global_const float attenuations[4][4] = {
-    {0.6f, 0.8f, 0.0f, 0.0f},
-    {0.6f, 0.8f, 0.0f, 0.0f},
-    {0.6f, 0.8f, 0.4f, 0.1f},
-    {0.6f, 0.8f, 0.5f, 0.2f},
+    {0.6f,  0.3f,  0.0f,  0.0f},
+    {1.0f,  0.8f,  0.0f,  0.0f},
+    {0.7f,  0.8f,  0.1f,  0.4f},
+    {0.7f,  0.8f,  0.5f,  0.4f},
 };
-
-
-global_const float presence_min = 0.0f;
-global_const float presence_max = 18.0f;
-global_const float resonance_min = 0.0f;
-global_const float resonance_max = 18.0f;
 
 enum Channels {
     CLEAN, 
@@ -148,9 +141,10 @@ struct SmoothParam {
     float b0 = 0.0f;
     float a1 = 0.0f;
     float y1 = 0.0f;
+    float value_buffer[BLOCK_SIZE] = {0};
 };
 
-void smooth_param_init(SmoothParam *param, float init_value) {
+static void smooth_param_init(SmoothParam *param, float init_value) {
     param->current_value = init_value;
     param->target = init_value;
     param->y1 = init_value;
@@ -158,17 +152,23 @@ void smooth_param_init(SmoothParam *param, float init_value) {
     param->a1 = 0.0f;
 }
 
-void smooth_param_new_target(SmoothParam *param, float new_target, float tau_ms, float samplerate) {
+static void smooth_param_new_target(SmoothParam *param, float new_target, float tau_ms, float samplerate) {
     param->b0 = sinf(PI_F / (samplerate * tau_ms * 0.001f));
     param->a1 = param->b0 - 1.0f;
     param->target = new_target;
 }
 
-float smooth_param_next_value(SmoothParam *param) {
+static inline float smooth_param_next_value(SmoothParam *param) {
     param->current_value = param->target * param->b0 - param->y1 * param->a1;
     param->y1 = param->current_value;
 
     return param->current_value;
+}
+
+static void smooth_param_compute_next_block(SmoothParam *param, u16 nvalues) {
+    for (u16 index = 0; index < nvalues; index++) {
+        param->value_buffer[index] = smooth_param_next_value(param);
+    }
 }
 
 
@@ -193,12 +193,12 @@ struct Biquad {
 };
 
 
-void biquad_reset(Biquad *f) {
+static void biquad_reset(Biquad *f) {
     f->w1 = 0.0f;
     f->w2 = 0.0f;
 }
 
-void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float samplerate, BiquadType type) {
+static void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float samplerate, BiquadType type) {
 
     float w0 = 2.0f * PI_F / samplerate * frequency;
     float cosw0 = cosf(w0);
@@ -216,8 +216,8 @@ void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float 
             f->b0 = (1.0f - cosw0) * 0.5f * a0inv;
             f->b1 = 2.0f * f->b0;
             f->b2 = f->b0;
-            f->a1 = -2.0f * cosw0 * a0inv;
-            f->a2 = (1.0f - alpha) * a0inv;
+            f->a1 = 2.0f * cosw0 * a0inv;
+            f->a2 = -(1.0f - alpha) * a0inv;
             break;
         }
 
@@ -229,8 +229,8 @@ void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float 
             f->b0 = (1.0f + alpha * A) * a0inv;
             f->b1 = -2.0f * cosw0 * a0inv;
             f->b2 = (1.0f - alpha * A) * a0inv;
-            f->a1 = f->b1;
-            f->a2 = (1.0f - alpha / A) * a0inv;
+            f->a1 = -f->b1;
+            f->a2 = -(1.0f - alpha / A) * a0inv;
             break;
         }
 
@@ -245,16 +245,27 @@ void biquad_set_coeffs(Biquad *f, float frequency, float Q, float gaindB, float 
     }
 }
 
-void biquad_process(Biquad *f, float *buffer, u16 n_samples) {
+static void biquad_process(Biquad *f, float *buffer, u16 n_samples) {
+    float b0 = f->b0;
+    float b1 = f->b1;
+    float b2 = f->b2;
+    float a1 = f->a1;
+    float a2 = f->a2;
+    
+    float w1 = f->w1;
+    float w2 = f->w2;
 
     for (u16 index = 0; index < n_samples; index++) {
+        
+        float w = buffer[index] + a1 * w1 + a2 * w2;
+        buffer[index] = b0 * w + b1 * w1 + b2 * w2;
 
-        float w = buffer[index] - f->a1 * f->w1 - f->a2 * f->w2;
-        buffer[index] = f->b0 * w + f->b1 * f->w1 + f->b2 * f->w2;
-
-        f->w2 = f->w1;
-        f->w1 = w;
+        w2 = w1;
+        w1 = w;
     }
+    
+    f->w1 = w1;
+    f->w2 = w2;    
 }
 
 
@@ -273,12 +284,12 @@ struct ShelfFilter {
     float out_gain = 1.0f;
 };
 
-void shelf_reset(ShelfFilter *f) {
+static void shelf_reset(ShelfFilter *f) {
     f->x1 = 0.0f;
     f->y1 = 0.0f;
 }
 
-void shelf_set_coeffs(ShelfFilter *f, float freq, float gain_db, float samplerate, ShelfType type) {
+static void shelf_set_coeffs(ShelfFilter *f, float freq, float gain_db, float samplerate, ShelfType type) {
     float gain_linear = 1.0f;
 
     switch (type) {
@@ -317,18 +328,29 @@ void shelf_set_coeffs(ShelfFilter *f, float freq, float gain_db, float samplerat
 
     f->b0 = (beta0 + rho * beta1)/(1.0f + rho * alpha1);
     f->b1 = (beta1 + rho * beta0)/(1.0f + rho * alpha1);
-    f->a1 = (rho + alpha1)/(1.0f + rho * alpha1);
+    f->a1 = -(rho + alpha1)/(1.0f + rho * alpha1);
 }
 
-void shelf_process(ShelfFilter *f, float *buffer, u16 n_samples) {
+static void shelf_process(ShelfFilter *f, float *buffer, u16 n_samples) {
+
+    float b0 = f->b0;
+    float b1 = f->b1;
+    float a1 = f->a1;
+    float x1 = f->x1;
+    float y1 = f->y1;
 
     for (u16 index = 0; index < n_samples; index++) {
-        float out_sample = f->b0*buffer[index] + f->b1*f->x1 - f->a1*f->y1;
-        f->x1 = buffer[index];
-        f->y1 = out_sample;
+        float input_sample = buffer[index];
+        
+        float out_sample = b0*input_sample + b1*x1 + a1*y1;
+        x1 = input_sample;
+        y1 = out_sample;
 
-        buffer[index] = out_sample;
+        buffer[index] = out_sample * f->out_gain; // * gain linear ? c'est pour ca que j'ai l'impression que ca fait rien ?
     }
+    
+    f->x1 = x1;
+    f->y1 = y1;
 }
 
 
@@ -338,18 +360,9 @@ struct DSPData {
 
     float samplerate = 0.0f;
     float upsamplerate = 0.0f;
-    float output_attenuation = dbtoa(-0.0f);
+    float output_attenuation = dbtoa(-9.0f);
 
     struct {
-        float knob4 = 0.0f;
-        float knob5 = 0.0f;
-        float knob6 = 0.0f;
-
-        bool fs1 = false;
-        u8 preamp_variant = 0;
-    } ui_states;
-
-    struct ParamStates {
         float gain1 = 0.0f;
         float gain2 = 0.0f;
         float volume = 0.0f;
@@ -358,27 +371,23 @@ struct DSPData {
         SmoothParam mid;
         SmoothParam trebble;
 
-        bool channel = 0;
+        u8 channel = CLEAN;
+        u8 preamp_variant = 0;
     } params;
 
 
     struct NoiseGate {
+
         float threshold = 0.0;
-
-        float *buffer = nullptr;
-        u32 buffer_length = 0;
         u32 buffer_index = 0;
-
         float absolute_sum = 0.0;
-
         SmoothParam gain;
-
         bool is_open = false;
 
     } gate;
 
-    OnePole tightFilter;
-    Biquad boostFilter;
+    OnePole tight_filter;
+    Biquad boost_filter;
 
     struct Preamp {
 
@@ -386,24 +395,24 @@ struct DSPData {
         OnePole input_filter;
         OnePole stage0LP;
 
-        OnePole inputMudFilter;
-        Biquad midBoost {BIQUAD_PEAK};
-        ShelfFilter brightCapFilter;
+        OnePole input_mud_filter;
+        Biquad mid_boost {BIQUAD_PEAK};
+        ShelfFilter bright_cap_filter;
 
         ShelfFilter cathode_bypass_filter1;
-        OnePole couplingFilter1;
+        OnePole coupling_filter1;
         OnePole stage1LP;
 
         ShelfFilter cathode_bypass_filter2;
-        OnePole couplingFilter2;
+        OnePole coupling_filter2;
         OnePole stage2LP;
 
         ShelfFilter cathode_bypass_filter3;
-        OnePole couplingFilter3;
+        OnePole coupling_filter3;
         OnePole stage3LP;
 
         ShelfFilter cathode_bypass_filter4;
-        OnePole couplingFilter4;
+        OnePole coupling_filter4;
         OnePole stage4LP;
 
         struct {
@@ -461,42 +470,7 @@ struct DSPData {
 } dsp;
 
 
-
-global_const struct TonestackCtes {
-    // Soldano SLO
-    const double beta11 = 0.0001175;
-    const double beta12 = 0.0005;
-    const double beta13 = 0.02047;
-    const double beta14 = 0.00051175;
-    const double beta21 = 0.0000002209;
-    const double beta22 = 0.000000255875;
-    const double beta23 = 0.000000314625;
-    const double beta24 = 0.0000032336;
-    const double beta25 = 0.000010235;
-    const double beta26 = 0.00000008084;
-    const double beta31 = 0.0000000013959;
-    const double beta32 = 0.0000000000348975;
-    const double beta33 = 0.0000000000348975;
-    const double beta34 = 0.000000000055225;
-    const double beta35 = 0.000000000055225;
-    const double beta36 = 0.000000002209;
-    const double alpha11 = 0.00250925;
-    const double alpha12 = 0.0005;
-    const double alpha13 = 0.02047;
-    const double alpha21 = -0.000000155375;
-    const double alpha22 = 0.000010235;
-    const double alpha23 = 0.000000255875;
-    const double alpha24 = 0.0000220336;
-    const double alpha25 = 0.00000077174;
-    const double alpha31 = 0.0000000013959;
-    const double alpha32 = 0.0000000000348975;
-    const double alpha33 = -0.0000000000203275;
-    const double alpha34 = 0.000000002209;
-    const double alpha35 = 0.000000000055225;
-} ctes;
-
-
-void grid_conduction(float *buffer, u16 n_samples) {
+static void grid_conduction(float *buffer, u16 n_samples) {
 
     local_const float gridCondThresh = 1.0f;
     local_const float gridCondRatio  = 2.0f;
@@ -524,35 +498,35 @@ void grid_conduction(float *buffer, u16 n_samples) {
     }
 }
 
-void tube_sim(float *buffer, u16 n_samples, float pre_bias, float post_bias) {
+static void tube_sim(float *buffer, u16 n_samples, float pre_bias, float post_bias) {
 
     for (u16 index = 0; index < n_samples; index++) {
 
-        float out_sample = buffer[index];
+        float sample = buffer[index];
 
-        out_sample *= -1.0f;
-        out_sample += pre_bias;
+        sample *= -1.0f;
+        sample += pre_bias;
 
-        local_const float positiveLinRange = 0.2f;
-        local_const float negClipPoint = 3.0f;
+        constexpr float positiveLinRange = 0.2f;
+        constexpr float negClipPoint = 3.0f;
 
-        if (out_sample > positiveLinRange) {
-            // out_sample = tanh(out_sample - positiveLinRange) + positiveLinRange;
-            out_sample = 1.0f - expf(positiveLinRange - out_sample) + positiveLinRange;
+        if (sample > positiveLinRange) {
+            float temp = (sample-positiveLinRange) * 0.5f + 1.0f;
+            sample = 1.0f - 1.0f/(temp*temp) + positiveLinRange;
         }
-        // else if (out_sample < -negClipPoint) {
-        //     out_sample = -negClipPoint;
+        // else if (sample < -negClipPoint) {
+        //     sample = -negClipPoint;
         // }
-        else if (out_sample < 0.0f) {
-            out_sample *= 2.0f/(3.0f*negClipPoint);
-            out_sample = out_sample < -1.0f ? -2.0f/3.0f : out_sample - 1.0f/3.0f * out_sample*out_sample*out_sample;
-            out_sample *= negClipPoint * 1.5f;
+        else if (sample < 0.0f) {
+            sample *= 2.0f/(3.0f*negClipPoint);
+            sample = sample < -1.0f ? -2.0f/3.0f : sample - 1.0f/3.0f * sample*sample*sample;
+            sample *= negClipPoint * 1.5f;
         }
-        buffer[index] = out_sample - post_bias;
+        buffer[index] = sample - post_bias;
     }
 }
 
-float generate_output_bias(float input_bias) {
+static float generate_output_bias(float input_bias) {
     local_const float positiveLinRange = 0.2f;
 
     if (input_bias > positiveLinRange) {
@@ -562,7 +536,7 @@ float generate_output_bias(float input_bias) {
     }
 }
 
-void set_biases(DSPData::Preamp *preamp, u32 index) {
+static void set_biases(DSPData::Preamp *preamp, u32 index) {
         
     preamp->stage0_bias[0] = channel_biases[index][0];
     preamp->stage0_bias[1] = generate_output_bias(preamp->stage0_bias[0]);
@@ -581,7 +555,7 @@ void set_biases(DSPData::Preamp *preamp, u32 index) {
 }
 
 
-void set_cathode_bypasses(DSPData::Preamp *preamp, u32 index) {
+static void set_cathode_bypasses(DSPData::Preamp *preamp, u32 index) {
     shelf_reset(&preamp->cathode_bypass_filter0);
     shelf_set_coeffs(&preamp->cathode_bypass_filter0, 280.0f, cathode_bp_amount[index][0], dsp.upsamplerate, lowshelf);
 
@@ -596,6 +570,12 @@ void set_cathode_bypasses(DSPData::Preamp *preamp, u32 index) {
 
     shelf_reset(&preamp->cathode_bypass_filter4);
     shelf_set_coeffs(&preamp->cathode_bypass_filter4, 280.0f, cathode_bp_amount[index][4], dsp.upsamplerate, lowshelf);
+}
+
+static void set_attenuations(DSPData::Preamp *preamp, u32 index) {
+    for (u32 i = 0; i < 4; i++) {
+        preamp->attenuations[i] = attenuations[index][i];
+    }
 }
 
 
@@ -622,12 +602,15 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
     if (switches[FS1].RisingEdge()) {
         dsp.params.channel = !dsp.params.channel;
         update_biases_and_cathodes = true;
+        
+        //@TODO update everything here
     }
 
-    if (variant != dsp.ui_states.preamp_variant) {
-        dsp.ui_states.preamp_variant = variant;
+    if (variant != dsp.params.preamp_variant) {
+        dsp.params.preamp_variant = variant;
         update_biases_and_cathodes = true;
     }
+
 
     // 0 = 3 stages, 1 = 5 stages
     if (update_biases_and_cathodes) {
@@ -636,13 +619,13 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
         u16 index = dsp.params.channel*2 + variant;
         
         set_biases(&dsp.preamp, index);
-        
         set_cathode_bypasses(&dsp.preamp, index);
+        set_attenuations(&dsp.preamp, index);
     }
 
     dsp.params.gain1 = tube_gain * scale(gain1, 0.0f, 1.0f, 0.0f, 1.0f, 2.0f);
 
-    shelf_set_coeffs(&dsp.preamp.brightCapFilter, 550.0f,
+    shelf_set_coeffs(&dsp.preamp.bright_cap_filter, 550.0f,
                     scale_linear(gain1, 0.0f, 1.0f, -10.0f, 0.0f),
                     dsp.upsamplerate, lowshelf);
 
@@ -652,22 +635,39 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
 
     // switches[Toggle3].Pressed();
 
-    float knob4 = hardware.adc.GetFloat(Knob4);
-    float knob5 = hardware.adc.GetFloat(Knob5);
-    float knob6 = hardware.adc.GetFloat(Knob6);
+    float knob4_value = hardware.adc.GetFloat(Knob4);
+    float knob5_value = hardware.adc.GetFloat(Knob5);
+    float knob6_value = hardware.adc.GetFloat(Knob6);
 
     // float low = hardware.adc.GetFloat(Knob4);
     // float mid = hardware.adc.GetFloat(Knob5);
     // float trebble = hardware.adc.GetFloat(Knob6);
 
-    dsp.ui_states.knob4 = knob4;
-    dsp.ui_states.knob5 = knob5;
-    dsp.ui_states.knob6 = knob6;
-    smooth_param_new_target(&dsp.params.low, knob4, smooth_tau_ms, dsp.samplerate);
-    smooth_param_new_target(&dsp.params.mid, knob5, smooth_tau_ms, dsp.samplerate);
-    smooth_param_new_target(&dsp.params.trebble, knob6, smooth_tau_ms, dsp.samplerate);
+    smooth_param_new_target(&dsp.params.low, knob4_value, smooth_tau_ms, dsp.samplerate);
+    smooth_param_new_target(&dsp.params.mid, knob5_value, smooth_tau_ms, dsp.samplerate);
+    smooth_param_new_target(&dsp.params.trebble, knob6_value, smooth_tau_ms, dsp.samplerate);
 
     {
+
+        enum {
+            beta11, beta12, beta13, beta14, 
+            beta21, beta22, beta23, beta24, beta25, beta26, 
+            beta31, beta32, beta33, beta34, beta35, beta36, 
+            alpha11, alpha12, alpha13, 
+            alpha21, alpha22, alpha23, alpha24, alpha25, 
+            alpha31, alpha32, alpha33, alpha34, alpha35
+        };
+
+        // Soldano SLO
+        local_const double ctes[29] = {
+            0.0001175, 0.0005, 0.02047, 0.00051175,
+            0.0000002209, 0.000000255875, 0.000000314625, 0.0000032336, 0.000010235, 0.00000008084,
+            0.0000000013959, 0.0000000000348975, 0.0000000000348975, 0.000000000055225, 0.000000000055225, 0.000000002209,
+            0.00250925, 0.0005, 0.02047,
+            -0.000000155375, 0.000010235, 0.000000255875, 0.0000220336, 0.00000077174,
+            0.0000000013959, 0.0000000000348975, -0.0000000000203275, 0.000000002209, 0.000000000055225,
+        }; 
+
         // recompute tonestack
         float low     = smooth_param_next_value(&dsp.params.low);
         float mid     = smooth_param_next_value(&dsp.params.mid);
@@ -679,37 +679,37 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
 
         Low = exp((Low-1.0)*3.4);
 
-        double B1 = Trebble*ctes.beta11 + Mid*ctes.beta12 + Low*ctes.beta13 + ctes.beta14;
+        double B1 = Trebble*ctes[beta11] + Mid*ctes[beta12] + Low*ctes[beta13] + ctes[beta14];
 
-        double B2 = Trebble*ctes.beta21
-                  - Mid*Mid*ctes.beta22
-                  + Mid*ctes.beta23
-                  + Low*ctes.beta24
-                  + Low*Mid*ctes.beta25
-                  + ctes.beta26;
+        double B2 = Trebble*ctes[beta21]
+                  - Mid*Mid*ctes[beta22]
+                  + Mid*ctes[beta23]
+                  + Low*ctes[beta24]
+                  + Low*Mid*ctes[beta25]
+                  + ctes[beta26];
 
-        double B3 = Low*Mid*ctes.beta31
-                  - Mid*Mid*ctes.beta32
-                  + Mid*ctes.beta33
-                  + Trebble*ctes.beta34 - Trebble*Mid*ctes.beta35
-                  + Trebble*Low*ctes.beta36;
+        double B3 = Low*Mid*ctes[beta31]
+                  - Mid*Mid*ctes[beta32]
+                  + Mid*ctes[beta33]
+                  + Trebble*ctes[beta34] - Trebble*Mid*ctes[beta35]
+                  + Trebble*Low*ctes[beta36];
 
         double A0 = 1.0;
 
-        double A1 = ctes.alpha11
-                  + Mid*ctes.alpha12 + Low*ctes.alpha13;
+        double A1 = ctes[alpha11]
+                  + Mid*ctes[alpha12] + Low*ctes[alpha13];
 
-        double A2 = Mid*ctes.alpha21
-                  + Low*Mid*ctes.alpha22
-                  - Mid*Mid*ctes.alpha23
-                  + Low*ctes.alpha24
-                  + ctes.alpha25;
+        double A2 = Mid*ctes[alpha21]
+                  + Low*Mid*ctes[alpha22]
+                  - Mid*Mid*ctes[alpha23]
+                  + Low*ctes[alpha24]
+                  + ctes[alpha25];
 
-        double A3 = Low*Mid*ctes.alpha31
-                  - Mid*Mid*ctes.alpha32
-                  + Mid*ctes.alpha33
-                  + Low*ctes.alpha34
-                  + ctes.alpha35;
+        double A3 = Low*Mid*ctes[alpha31]
+                  - Mid*Mid*ctes[alpha32]
+                  + Mid*ctes[alpha33]
+                  + Low*ctes[alpha34]
+                  + ctes[alpha35];
 
         double c = 2.0*dsp.samplerate;
 
@@ -720,18 +720,19 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
         dsp.tonestack.b1 = (float)((-B1*c + B2 * pow(c, 2.0) + 3*B3 * pow(c, 3.0))/a0);
         dsp.tonestack.b2 = (float)((B1*c + B2 * pow(c, 2.0) - 3*B3 * pow(c, 3.0))/a0);
         dsp.tonestack.b3 = (float)((B1*c - B2 * pow(c, 2.0) + B3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a1 = (float)((-3*A0 - A1*c + A2 * pow(c, 2.0) + 3*A3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a2 = (float)((-3*A0 + A1*c + A2 * pow(c, 2.0) - 3*A3 * pow(c, 3.0))/a0);
-        dsp.tonestack.a3 = (float)((-A0 + A1*c - A2 * pow(c, 2.0) + A3 * pow(c, 3.0))/a0);
+        dsp.tonestack.a1 = -(float)((-3*A0 - A1*c + A2 * pow(c, 2.0) + 3*A3 * pow(c, 3.0))/a0);
+        dsp.tonestack.a2 = -(float)((-3*A0 + A1*c + A2 * pow(c, 2.0) - 3*A3 * pow(c, 3.0))/a0);
+        dsp.tonestack.a3 = -(float)((-A0 + A1*c - A2 * pow(c, 2.0) + A3 * pow(c, 3.0))/a0);
     }
 
     // Boost section
+    // @TODO do not recompute everytime 
     if (dsp.params.channel == CLEAN) {
-        dsp.tightFilter.SetFrequency(300.0f/dsp.samplerate);
-        biquad_set_coeffs(&dsp.boostFilter, 800.0f, 0.2f, 6.0f, dsp.samplerate, BIQUAD_PEAK);
+        dsp.tight_filter.SetFrequency(300.0f/dsp.samplerate);
+        biquad_set_coeffs(&dsp.boost_filter, 800.0f, 0.2f, 6.0f, dsp.samplerate, BIQUAD_PEAK);
     } else {
-        dsp.tightFilter.SetFrequency(300.0f/dsp.samplerate);
-        biquad_set_coeffs(&dsp.boostFilter, 1200.0f, 0.2f, 10.0f, dsp.samplerate, BIQUAD_PEAK);
+        dsp.tight_filter.SetFrequency(400.0f/dsp.samplerate);
+        biquad_set_coeffs(&dsp.boost_filter, 1200.0f, 0.2f, 0.0f, dsp.samplerate, BIQUAD_PEAK);
     }
 
     // main process
@@ -740,23 +741,29 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
 
 
     // process gate
-    if (do_gate) {
+    if (1) {
         DSPData::NoiseGate &gate = dsp.gate;
 
-        local_const float attack_time_ms = 1.0f;
-        local_const float release_time_ms = 10.0f;
+        gate.threshold = dbtoa(gate_thresh[dsp.params.channel][do_gate]);
+
+        local_const float attack_time_ms = 0.5f;
+        local_const float release_time_ms = 15.0f;
         // local_const float hysteresis = 0.0f;
         // local_const float return_gain = 0.0f;
-
+        
+        float gate_absolute_sum = gate.absolute_sum;
+        u32 gate_buffer_index = gate.buffer_index; 
+        const float gate_threshold = gate.threshold;
+                        
         for (u16 index = 0; index < nsamples; index++) {
 
-            gate.absolute_sum -= abs(gate.buffer[gate.buffer_index]);
+            gate_absolute_sum -= abs(gate_buffer[gate_buffer_index]);
 
-            gate.buffer[gate.buffer_index] = audio_buffer[index];
-            gate.absolute_sum += abs(gate.buffer[gate.buffer_index]);
+            gate_buffer[gate_buffer_index] = audio_buffer[index];
+            gate_absolute_sum += abs(gate_buffer[gate_buffer_index]);
 
-            gate.buffer_index++;
-            if (gate.buffer_index == gate.buffer_length) { gate.buffer_index = 0; }
+            gate_buffer_index++;
+            if (gate_buffer_index == gate_buffer_length) { gate_buffer_index = 0; }
 
             // if close && > thresh -> open
             // if close && < thresh -> close
@@ -764,9 +771,9 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             // if open && < thresh -hyst -> close
 
             bool should_open = false;
-            float amplitude = gate.absolute_sum / gate.buffer_length;
+            float amplitude = gate_absolute_sum / (float)gate_buffer_length;
 
-            if (amplitude > gate.threshold) {
+            if (amplitude > gate_threshold) {
                 should_open = true;
             }
 
@@ -774,7 +781,7 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             //     should_open = true;
             // }
 
-            // if (amplitude < gate.threshold) {
+            // if (amplitude < gate_threshold) {
             //     should_open = false;
             // }
 
@@ -787,17 +794,22 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
                 gate.is_open = false;
             }
 
-            float gain_value = smooth_param_next_value(&gate.gain);
-
-            audio_buffer[index] *= gain_value;
+            gate.gain.value_buffer[index] = smooth_param_next_value(&gate.gain);
         }
+        
+        for (u16 index = 0; index < nsamples; index++) {
+            audio_buffer[index] *= gate.gain.value_buffer[index];
+        }
+
+        gate.absolute_sum = gate_absolute_sum;
+        gate.buffer_index = gate_buffer_index; 
     }
 
     // tight boost
 
     if (do_boost) {
-        dsp.tightFilter.ProcessBlock(audio_buffer, nsamples);
-        biquad_process(&dsp.boostFilter, audio_buffer, nsamples);
+        dsp.tight_filter.ProcessBlock(audio_buffer, nsamples);
+        biquad_process(&dsp.boost_filter, audio_buffer, nsamples);
     }
 
     // preamp
@@ -824,23 +836,23 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             preamp.input_filter.ProcessBlock(up_buffer, up_nsamples);
             preamp.stage0LP.ProcessBlock(up_buffer, up_nsamples);
 
-            apply_gain_linear(dsp.params.gain1 * 0.6f, up_buffer, up_nsamples);
+            apply_gain_linear(dsp.params.gain1 * dsp.preamp.attenuations[0], up_buffer, up_nsamples);
 
-            preamp.inputMudFilter.ProcessBlock(up_buffer, up_nsamples);
-            biquad_process(&preamp.midBoost, up_buffer, up_nsamples);
+            preamp.input_mud_filter.ProcessBlock(up_buffer, up_nsamples);
+            biquad_process(&preamp.mid_boost, up_buffer, up_nsamples);
 
 
-            shelf_process(&preamp.brightCapFilter, up_buffer, up_nsamples);
+            shelf_process(&preamp.bright_cap_filter, up_buffer, up_nsamples);
 
             // ------------ Stage 1 ------------
             grid_conduction(up_buffer, up_nsamples);
             shelf_process(&preamp.cathode_bypass_filter1, up_buffer, up_nsamples);
             tube_sim(up_buffer, up_nsamples, preamp.stage1_bias[0], preamp.stage1_bias[1]);
 
-            preamp.couplingFilter1.ProcessBlock(up_buffer, up_nsamples);
+            preamp.coupling_filter1.ProcessBlock(up_buffer, up_nsamples);
             preamp.stage1LP.ProcessBlock(up_buffer, up_nsamples);
 
-            apply_gain_linear(dsp.params.gain2 * 0.8f, up_buffer, up_nsamples);
+            apply_gain_linear(dsp.params.gain2 * dsp.preamp.attenuations[1], up_buffer, up_nsamples);
 
 
             // ------------ Stage 2 ------------
@@ -848,15 +860,17 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             shelf_process(&preamp.cathode_bypass_filter2, up_buffer, up_nsamples);
             tube_sim(up_buffer, up_nsamples, preamp.stage2_bias[0], preamp.stage2_bias[1]);
 
-            preamp.couplingFilter2.ProcessBlock(up_buffer, up_nsamples);
+            preamp.coupling_filter2.ProcessBlock(up_buffer, up_nsamples);
             preamp.stage2LP.ProcessBlock(up_buffer, up_nsamples);
 
             if (dsp.params.channel == CLEAN) {
+
+                local_const float clean_compensation_gain = 0.4f;
+                apply_gain_linear(clean_compensation_gain, up_buffer, up_nsamples);
                 goto gain_stages_end_of_scope;
             }
 
-            local_const float attenuation2 = 0.4f * tube_gain;
-            apply_gain_linear(attenuation2, up_buffer, up_nsamples);
+            apply_gain_linear(dsp.preamp.attenuations[2] * tube_gain, up_buffer, up_nsamples);
 
 
             // ------------ Stage 3 ------------
@@ -864,11 +878,10 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             shelf_process(&preamp.cathode_bypass_filter3, up_buffer, up_nsamples);
             tube_sim(up_buffer, up_nsamples, preamp.stage3_bias[0], preamp.stage3_bias[1]);
 
-            preamp.couplingFilter3.ProcessBlock(up_buffer, up_nsamples);
+            preamp.coupling_filter3.ProcessBlock(up_buffer, up_nsamples);
             preamp.stage3LP.ProcessBlock(up_buffer, up_nsamples);
 
-            local_const float attenuation3 = 0.1f * tube_gain;
-            apply_gain_linear(attenuation3, up_buffer, up_nsamples);
+            apply_gain_linear(dsp.preamp.attenuations[3] * tube_gain, up_buffer, up_nsamples);
 
 
             // ------------ Stage 4 ------------
@@ -876,7 +889,7 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
             shelf_process(&preamp.cathode_bypass_filter4, up_buffer, up_nsamples);
             tube_sim(up_buffer, up_nsamples, preamp.stage4_bias[0], preamp.stage4_bias[1]);
 
-            preamp.couplingFilter4.ProcessBlock(up_buffer, up_nsamples);
+            preamp.coupling_filter4.ProcessBlock(up_buffer, up_nsamples);
             preamp.stage4LP.ProcessBlock(up_buffer, up_nsamples);
 
             local_const float dist_compensation_gain = dbtoa(-27.0f);
@@ -898,25 +911,48 @@ void AudioCallback(AudioHandle::InputBuffer  in, AudioHandle::OutputBuffer out, 
     // tonestack
     {
         DSPData::Tonestack &ts = dsp.tonestack;
-
+        
+        const float b0 = ts.b0;
+        const float b1 = ts.b1;
+        const float b2 = ts.b2;
+        const float b3 = ts.b3;
+        const float a1 = ts.a1;
+        const float a2 = ts.a2;
+        const float a3 = ts.a3;
+        
+        float x1 = ts.x1;
+        float x2 = ts.x2;
+        float x3 = ts.x3;
+        float y1 = ts.y1;
+        float y2 = ts.y2;
+        float y3 = ts.y3;
+        
         for (u16 index = 0; index < nsamples; index++) {
-            float out_sample = audio_buffer[index] * ts.b0
-                                + ts.x1 * ts.b1
-                                + ts.x2 * ts.b2
-                                + ts.x3 * ts.b3
-                                - ts.y1 * ts.a1
-                                - ts.y2 * ts.a2
-                                - ts.y3 * ts.a3;
+            float input_sample = audio_buffer[index];
+            float out_sample = input_sample * b0
+                                + x1 * b1
+                                + x2 * b2
+                                + x3 * b3
+                                + y1 * a1
+                                + y2 * a2
+                                + y3 * a3;
 
-            ts.x3 = ts.x2;
-            ts.x2 = ts.x1;
-            ts.x1 = audio_buffer[index];
+            x3 = x2;
+            x2 = x1;
+            x1 = input_sample;
 
-            ts.y3 = ts.y2;
-            ts.y2 = ts.y1;
-            ts.y1 = out_sample;
+            y3 = y2;
+            y2 = y1;
+            y1 = out_sample;
             audio_buffer[index] = out_sample;
         }
+        
+        ts.x1 = x1;
+        ts.x2 = x2;
+        ts.x3 = x3;
+        ts.y1 = y1;
+        ts.y2 = y2;
+        ts.y3 = y3;
     }
 
     // res / pres
@@ -1012,10 +1048,7 @@ int main(void) {
 
 
     hardware.adc.Init(adc_configs, nKNOBS);
-    //Start the adc
     hardware.adc.Start();
-
-    hardware.StartLog();
 
     smooth_param_init(&dsp.params.low, 0.5f);
     smooth_param_init(&dsp.params.mid, 0.5f);
@@ -1024,25 +1057,21 @@ int main(void) {
     {
         DSPData::NoiseGate &gate = dsp.gate;
 
-        local_const float gate_buffer_length_sec = 0.01f;
-
-        gate.buffer_length = (u32)(dsp.samplerate * gate_buffer_length_sec);
         gate.buffer_index = 0;
         gate.absolute_sum = 0.0;
-        gate.threshold = dbtoa(-60.0);
+        gate.threshold = dbtoa(gate_thresh[CLEAN][0]);
         // gate.return_gain = gate.threshold;
         gate.is_open = false;
 
-        gate.buffer = (float *)calloc(gate.buffer_length, sizeof(float));
         smooth_param_init(&gate.gain, 0.0f);
     }
 
-    dsp.tightFilter.Init();
-    dsp.tightFilter.SetFrequency(400.0f/dsp.samplerate);
-    dsp.tightFilter.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+    dsp.tight_filter.Init();
+    dsp.tight_filter.SetFrequency(400.0f/dsp.samplerate);
+    dsp.tight_filter.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-    biquad_reset(&dsp.boostFilter);
-    biquad_set_coeffs(&dsp.boostFilter, 1200.0f, 0.2, 8.0f, dsp.samplerate, BIQUAD_PEAK);
+    biquad_reset(&dsp.boost_filter);
+    biquad_set_coeffs(&dsp.boost_filter, 1200.0f, 0.2, 8.0f, dsp.samplerate, BIQUAD_PEAK);
 
     {
         DSPData::Preamp &preamp = dsp.preamp;
@@ -1051,32 +1080,32 @@ int main(void) {
         preamp.input_filter.SetFrequency(100.0f/dsp.upsamplerate); // 100.0
         preamp.input_filter.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-        preamp.inputMudFilter.Init();
-        preamp.inputMudFilter.SetFrequency(400.0f/dsp.upsamplerate);
-        preamp.inputMudFilter.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+        preamp.input_mud_filter.Init();
+        preamp.input_mud_filter.SetFrequency(400.0f/dsp.upsamplerate);
+        preamp.input_mud_filter.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-        biquad_reset(&preamp.midBoost);
-        biquad_set_coeffs(&preamp.midBoost, 1000.0f, 0.2f, 3.0f, dsp.upsamplerate, BIQUAD_PEAK);
+        biquad_reset(&preamp.mid_boost);
+        biquad_set_coeffs(&preamp.mid_boost, 1000.0f, 0.2f, 3.0f, dsp.upsamplerate, BIQUAD_PEAK);
 
-        shelf_reset(&preamp.brightCapFilter);
-        shelf_set_coeffs(&preamp.brightCapFilter, 550.0f, 0.0f, dsp.upsamplerate, lowshelf);
+        shelf_reset(&preamp.bright_cap_filter);
+        shelf_set_coeffs(&preamp.bright_cap_filter, 550.0f, 0.0f, dsp.upsamplerate, lowshelf);
 
 
-        preamp.couplingFilter1.Init();
-        preamp.couplingFilter1.SetFrequency(15.0f / dsp.upsamplerate);
-        preamp.couplingFilter1.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+        preamp.coupling_filter1.Init();
+        preamp.coupling_filter1.SetFrequency(15.0f / dsp.upsamplerate);
+        preamp.coupling_filter1.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-        preamp.couplingFilter2.Init();
-        preamp.couplingFilter2.SetFrequency(15.0f / dsp.upsamplerate);
-        preamp.couplingFilter2.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+        preamp.coupling_filter2.Init();
+        preamp.coupling_filter2.SetFrequency(15.0f / dsp.upsamplerate);
+        preamp.coupling_filter2.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-        preamp.couplingFilter3.Init();
-        preamp.couplingFilter3.SetFrequency(15.0f / dsp.upsamplerate);
-        preamp.couplingFilter3.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+        preamp.coupling_filter3.Init();
+        preamp.coupling_filter3.SetFrequency(15.0f / dsp.upsamplerate);
+        preamp.coupling_filter3.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
-        preamp.couplingFilter4.Init();
-        preamp.couplingFilter4.SetFrequency(15.0f / dsp.upsamplerate);
-        preamp.couplingFilter4.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
+        preamp.coupling_filter4.Init();
+        preamp.coupling_filter4.SetFrequency(15.0f / dsp.upsamplerate);
+        preamp.coupling_filter4.SetFilterMode(OnePole::FilterMode::FILTER_MODE_HIGH_PASS);
 
 
         preamp.stage0LP.Init();
@@ -1099,10 +1128,10 @@ int main(void) {
         preamp.stage4LP.SetFrequency(12000.0f / dsp.upsamplerate);
         preamp.stage4LP.SetFilterMode(OnePole::FilterMode::FILTER_MODE_LOW_PASS);
 
-        set_biases(&dsp.preamp, 0);
-        
-        set_cathode_bypasses(&dsp.preamp, 0);
-
+        u32 config_index = dsp.params.channel * 2 + dsp.params.preamp_variant;
+        set_biases(&dsp.preamp, config_index);
+        set_cathode_bypasses(&dsp.preamp, config_index);
+        set_attenuations(&dsp.preamp, config_index);
 
         biquad_reset(&preamp.oversampler.upsample_filter1);
         biquad_set_coeffs(&preamp.oversampler.upsample_filter1, dsp.samplerate/2.0f * 0.9f,
@@ -1123,22 +1152,22 @@ int main(void) {
     }
 
     shelf_reset(&dsp.resonance);
-    shelf_set_coeffs(&dsp.resonance, 120.0f, scale_linear(0.5f, 0.0f, 1.0f, 0.0f, 24.0f), dsp.samplerate, lowshelf);
+    shelf_set_coeffs(&dsp.resonance, 120.0f, 12.0f, dsp.samplerate, lowshelf);
 
     shelf_reset(&dsp.presence);
-    shelf_set_coeffs(&dsp.presence, 500.0f, scale_linear(0.6f, 0.0f, 1.0f, 0.0f, 18.0f), dsp.samplerate, highshelf);
+    shelf_set_coeffs(&dsp.presence, 500.0f, 10.0f, dsp.samplerate, highshelf);
 
     {
         dsp.irloader.fft_setup = pffft_new_setup(fft_size, PFFFT_REAL);
-
+    
         for (u16 part_index = 0; part_index < npartitions; part_index++) {
             dsp.irloader.fdl_ptrs[part_index] = dsp.irloader.fdl[part_index];
         }
-
+    
         for (u16 part_index = 0; part_index < npartitions; part_index++) {
             memset(dsp.irloader.signal_time_buffer, 0, fft_size * sizeof(float));
             memcpy(dsp.irloader.signal_time_buffer, &ir[part_index * BLOCK_SIZE], BLOCK_SIZE * sizeof(float));
-
+    
             pffft_transform(dsp.irloader.fft_setup, dsp.irloader.signal_time_buffer, dsp.irloader.ir_parts_dft[part_index], nullptr, PFFFT_FORWARD);
         }
     }
